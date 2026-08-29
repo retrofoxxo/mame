@@ -1,6 +1,7 @@
 name: CI (macOS)
 
 on:
+  workflow_dispatch: # Enables the manual run button
   push:
     paths:
     - '.github/workflows/**'
