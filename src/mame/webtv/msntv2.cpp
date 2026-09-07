@@ -70,6 +70,7 @@ public:
 
 protected:
 
+	virtual void device_resolve_objects() override;
 	virtual void machine_start() override;
 	virtual void machine_reset() override;
 
@@ -130,6 +131,63 @@ private:
 	void runtime_w(offs_t offset, uint8_t data);
 
 };
+
+void msntv2_state::device_resolve_objects()
+{
+	m_maincpu->drc_set_options((i386_device::I386DRC_FASTEST_OPTIONS | i386_device::I386DRC_SMC_CHECK_PVARI));
+
+	const uint32_t PHYSICAL_RAM_SIZE = m_mcu->get_allocated_ram_size();
+
+	uint32_t *physical_ram_ptr = m_mcu->get_ram_pointer();
+
+	// Memory used by WinCE
+
+	const uint32_t FASTRAM_WINCE_START = 0x00100000;
+	if (PHYSICAL_RAM_SIZE > FASTRAM_WINCE_START)
+	{
+		const uint32_t FASTRAM_WINCE_END = (PHYSICAL_RAM_SIZE - 1);
+		m_maincpu->i386drc_add_fastram(FASTRAM_WINCE_START, FASTRAM_WINCE_END, false, physical_ram_ptr + (FASTRAM_WINCE_START >> 2));
+	}
+
+	// Memory used in DOS or the BIOS
+
+	const uint32_t FASTRAM_DOS_START = 0x00000000;
+	const uint32_t FASTRAM_DOS_END   = (0x000a0000 - 1);
+	m_maincpu->i386drc_add_fastram(FASTRAM_DOS_START, FASTRAM_DOS_END, false, physical_ram_ptr + (FASTRAM_DOS_START >> 2));
+
+	// The graphics registers, poking holes that need special control
+
+	uint32_t *mm_block_ptr = m_gfx->get_mm_block_pointer();
+
+	const uint32_t GFX_MMADR_SIZE  = i82830_graphics_device::MM_SIZE;
+	const uint32_t GFX_MMADR_START = 0xfeb00000;
+	const uint32_t GFX_MMADR_END   = GFX_MMADR_START + (GFX_MMADR_SIZE - 1);
+
+	const offs_t mmadr_excluded[] = {
+		GFX_MMADR_START + (i82830_graphics_device::MM_IOCNTL_GPIOA << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_IOCNTL_GPIOB << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_IOCNTL_GPIOC << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_TV_HTOTAL << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_TV_VTOTAL << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_DISPLAY_UNKNOWN1 << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_CNTL_PRINGBUF_CNTL << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_CNTL_PRINGBUF_HEAD << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_CNTL_PRINGBUF_TAIL << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_DPLLA_CTRL << 2),
+		GFX_MMADR_START + (i82830_graphics_device::MM_CNTL_IIR << 2),
+	};
+	m_maincpu->i386drc_add_fastram(GFX_MMADR_START, GFX_MMADR_END, false, mm_block_ptr, 0, mmadr_excluded, std::size(mmadr_excluded), true, true);
+
+	// The graphics VRAM paged using the GTT table
+
+	const uint32_t GFX_GMADR_SIZE  = 70 * 1024 * 1024; // matches map_extra()'s gm_map install size
+	const uint32_t GFX_GMADR_START = 0xf0000000;
+	const uint32_t GFX_GMADR_END   = GFX_GMADR_START + (GFX_GMADR_SIZE - 1);
+
+	m_maincpu->i386drc_add_fastpaged(
+			GFX_GMADR_START, GFX_GMADR_END, mm_block_ptr, (i82830_graphics_device::MM_GTT_PAGE_TABLE_SIZE - 1), i82830_graphics_device::MM_GTT_PAGE_TABLE, i82830_graphics_device::MM_GTT_PAGE_ADDR32_SHIFT, i82830_graphics_device::MM_GTT_PAGE_ADDR32_OMASK, i82830_graphics_device::MM_GTT_PAGE_TABLE_VALID, physical_ram_ptr, PHYSICAL_RAM_SIZE, 4
+	);
+}
 
 void msntv2_state::machine_start()
 {
@@ -544,8 +602,11 @@ void msntv2_state::msntv2(machine_config &config)
 {
 	config.set_default_layout(layout_webtv);
 
+	uint32_t usable_ram_size = 128 * 1024 * 1024;
+
 	P3CELERON(config, m_maincpu, 733'333'333); // "Socket 479" mobile Celeron on RM4100, "Socket 479" mobile Pentium 3 on IP1000
 	m_maincpu->set_irq_acknowledge_callback(m_south_lpc_bridge, FUNC(i82801_lpc_device::irq_acknowledge));
+	m_maincpu->drc_set_cache_size(480 * 1024 * 1024);
 
 	// The MSNTV2 uses CX25873 chip that is controlled by an I2C signal from the northbridge's graphics GPIO pins.
 	CX25873(config, m_cx25873, 0x88);
@@ -554,7 +615,7 @@ void msntv2_state::msntv2(machine_config &config)
 
 		// The MSNTV2 v1.387 BIOS will assume 128MB is on the board and then query the SMBus for SPD data to add additional memory.
 		// The MSNTV2 board has a DIMM slot footprint on the board to add additional memory modules.
-		I82830_HOST(config, m_mcu, 0, "maincpu", 128 * 1024 * 1024); // 128MB max system RAM, exact amount configured from the BIOS
+		I82830_HOST(config, m_mcu, 0, "maincpu", usable_ram_size);
 			m_mcu->interrupt_pin_w(0, i82801_lpc_device::INT_PIN_NONE);
 			m_mcu->enable_agp(false); // The AGP bridge @ pci:01.0 is not available
 
@@ -644,14 +705,48 @@ ROM_START(msntv2)
 	//     - '+' not sure, might be verbose boot logging to a log file in the boot partition.
 	//     - '@URL' load a custom application via URL. Looks to be BOOT.SIG verified.
 	//
-	// bios-emac.bin is a RM4100 Retail BIOS (v1.387) BIOS with these notes:
+	// bios-emac-mame-only.bin [NOT IDEAL ON REAL HARDWARE] is a RM4100 Retail BIOS (v1.387) BIOS with these notes:
 	//     - Removed BIOS checksum checking so the BIOS can be modified (easily). [POST error code 135]
 	//     - Change upgrade/disaster recovery host from headwaiter.msntv.msn.com to msntv2.ooguy.com. NOTE: this can also be done through DNS spoofing.
 	//     - Removed memory checking to speed up boot.
 	//     - Removed RSA SHA1 signature checking. MD5 integrety checking still exists.
+	//     - Swapped out the loading and video test bitmap (visual change only).
+	//     - Removed the PIC chip data/code check.
+	//        NOTE: This could cause keyboard issues on real hardware.
+	//     - Reduced keyboard input wait period before the splash screen (and after you see 'C' in the console) to speed up boot. Keys it's scanning for:
+	//        NOTE: this will make it harder to use PO codes on real hardware.
+	//         Ctrl+U:   pause boot.
+	//         Ctrl+Q:   resume boot
+	//         Left Alt: go into BIOS power off code mode
+	//             12357     callback @ 0x008165f8
+	//             217       callback @ 0x008165b8
+	//             218       callback @ 0x008165c0
+	//             219       callback @ 0x008165dc
+	//             55325532  callback @ 0x008160b8
+	//             8675309   callback @ 0x00816078
+	//             8088      callback @ 0x00816618
+	//             32767     callback @ 0x008166d0
+	//             32768     callback @ 0x00816690
+	//             77437     callback @ 0x00816128
+	//             555       callback @ 0x0081670c
+	//             93288     callback @ 0x008161bc
+	//             415865808 callback @ 0x008162f4
+	//             415865818 callback @ 0x008162e0
+	//             415865828 callback @ 0x00816414
+	//             415865838 callback @ 0x008163e8
+	//             8086      callback @ 0x008161cc
+	//             2020      callback @ 0x008161d4
+	//             2021      callback @ 0x008161dc
+	//             802       callback @ 0x008161e4
+	//             56000     callback @ 0x008161ec
+	//             503       callback @ 0x00816274
+	//             504       callback @ 0x00816288
+	//             93289     callback @ 0x00816130
+	//             417       callback @ 0x00816620
+	//             1200      callback @ 0x008162d8
 	//
 	ROM_SYSTEM_BIOS(0, "emac", "RM4100 emac-mod BIOS (v1.387)")
-	ROMX_LOAD("bios-emac.bin", 0x000000, 0x100000, NO_DUMP, ROM_BIOS(0))
+	ROMX_LOAD("bios-emac-mame-only.bin", 0x000000, 0x100000, NO_DUMP, ROM_BIOS(0))
 	//
 	// bios-retail.bin is the stock MSNTV2 BIOS. This will boot fine, just not with the modified HackTV CF image because of the RSA SHA1 gate.
 	//
